@@ -19,6 +19,7 @@ import argparse
 import json
 from sqlalchemy import func, and_, or_, select, desc, asc, cast, collate, inspect
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import selectinload
 import mimetypes
 
 app = Flask(__name__)
@@ -708,25 +709,72 @@ def application_detail(id):
         abort(404)
     return application_schema.jsonify(application)
 
-def resolve_objectid(oid):
-    res = db.session.get(User, oid)
-    if res:
-        return 'User', users_schema.dump([res])[0]
-    res = db.session.get(ServicePrincipal, oid)
-    if res:
-        return 'ServicePrincipal', serviceprincipals_schema.dump([res])[0]
-    res = db.session.get(Group, oid)
-    if res:
-        return 'Group', groups_schema.dump([res])[0]
-    res = db.session.get(Device, oid)
-    if res:
-        return 'Device', devices_schema.dump([res])[0]
-    res = db.session.get(Application, oid)
-    if res:
-        return 'Application', applications_schema.dump([res])[0]
-    return 'Unknown', None
+def query_by_ids(entities, idcolumn, ids, options=()):
+    '''
+    Query objects or columns where idcolumn is one of ids, in chunks to
+    stay below the bound parameter limit. Returns a dict of id -> row.
+    Used to load all objects referenced by a list in one go instead of
+    one query per object.
+    '''
+    ids = list(ids)
+    result = {}
+    for i in range(0, len(ids), 500):
+        query = db.session.query(*entities).filter(idcolumn.in_(ids[i:i+500])).options(*options)
+        for row in query:
+            result[getattr(row, idcolumn.key)] = row
+    return result
 
-def translate_rolescopes(scopes):
+def resolve_objectids(oids):
+    '''
+    Find the object type of each objectId and dump it with the matching list schema.
+    Returns a dict of objectId -> (type, dump, object), objects that are not found are left out.
+    Types are checked in the same order as the GUI did before: User, ServicePrincipal, Group,
+    Device, Application.
+    '''
+    sp_owners = (selectinload(ServicePrincipal.ownerUsers), selectinload(ServicePrincipal.ownerServicePrincipals))
+    lookups = (
+        ('User', User, users_schema, ()),
+        ('ServicePrincipal', ServicePrincipal, serviceprincipals_schema, sp_owners),
+        # Group members are needed to expand role assignments to groups
+        ('Group', Group, groups_schema, (selectinload(Group.memberUsers),
+                                         selectinload(Group.memberServicePrincipals).selectinload(ServicePrincipal.ownerUsers),
+                                         selectinload(Group.memberServicePrincipals).selectinload(ServicePrincipal.ownerServicePrincipals))),
+        ('Device', Device, devices_schema, ()),
+        ('Application', Application, applications_schema, (selectinload(Application.ownerUsers), selectinload(Application.ownerServicePrincipals))),
+    )
+    remaining = set(oids)
+    resolved = {}
+    for otype, model, schema, options in lookups:
+        for oid, obj in query_by_ids((model,), model.objectId, remaining, options).items():
+            resolved[oid] = (otype, schema.dump([obj])[0], obj)
+        remaining -= resolved.keys()
+    return resolved
+
+def get_scope_names(scopes):
+    '''
+    Look up the display names of all objects referenced in a list of role scopes.
+    Returns a dict of model -> {objectId: displayName} for translate_rolescopes.
+    '''
+    ids = {AdministrativeUnit: set(), Application: set(), ServicePrincipal: set()}
+    for scope in scopes:
+        parts = scope.split('/')
+        if len(parts) > 2:
+            if parts[1] == 'administrativeUnits':
+                ids[AdministrativeUnit].add(parts[2])
+            elif parts[1] == 'applications':
+                ids[Application].add(parts[2])
+            elif parts[1] == 'servicePrincipals':
+                ids[ServicePrincipal].add(parts[2])
+        elif len(parts) > 1 and len(parts[1]) > 0:
+            ids[ServicePrincipal].add(parts[1])
+            ids[Application].add(parts[1])
+    names = {}
+    for model, mids in ids.items():
+        rows = query_by_ids((model.objectId, model.displayName), model.objectId, mids)
+        names[model] = {oid: row.displayName for oid, row in rows.items()}
+    return names
+
+def translate_rolescopes(scopes, names):
     stypes = []
     sids = []
     snames = []
@@ -738,41 +786,35 @@ def translate_rolescopes(scopes):
             sid = parts[2]
             if stype == 'administrativeUnits':
                 stype = 'AdministrativeUnit'
-                res = db.session.get(AdministrativeUnit, sid)
-                if res:
-                    sname = f'AU: {res.displayName}'
+                if sid in names[AdministrativeUnit]:
+                    sname = f'AU: {names[AdministrativeUnit][sid]}'
                 else:
                     sname = 'Unknown administrative unit'
             elif stype == 'applications':
                 stype = 'Application'
-                res = db.session.get(Application, sid)
-                if res:
-                    sname = f'Application: {res.displayName}'
+                if sid in names[Application]:
+                    sname = f'Application: {names[Application][sid]}'
                 else:
                     sname = 'Unknown application'
             elif stype == 'servicePrincipals':
                 stype = 'ServicePrincipal'
-                res = db.session.get(ServicePrincipal, sid)
-                if res:
-                    sname = f'ServicePrincipal: {res.displayName}'
+                if sid in names[ServicePrincipal]:
+                    sname = f'ServicePrincipal: {names[ServicePrincipal][sid]}'
                 else:
                     sname = 'Unknown serviceprincipal'
             else:
                 sname = f'Unsupported scope type: {scope}'
         elif len(parts) > 1 and len(parts[1]) > 0:
             sid = parts[1]
-            res = db.session.get(ServicePrincipal, sid)
-            if res:
+            if sid in names[ServicePrincipal]:
                 stype = 'ServicePrincipal'
-                sname = f'ServicePrincipal: {res.displayName}'
+                sname = f'ServicePrincipal: {names[ServicePrincipal][sid]}'
+            elif sid in names[Application]:
+                stype = 'Application'
+                sname = f'Application: {names[Application][sid]}'
             else:
-                res = db.session.get(Application, sid)
-                if res:
-                    stype = 'Application'
-                    sname = f'Application: {res.displayName}'
-                else:
-                    stype = 'Unknown'
-                    sname = f'Unknown scope type: {scope}'
+                stype = 'Unknown'
+                sname = f'Unknown scope type: {scope}'
         else:
             # Scope is entire directory
             stype = 'Directory'
@@ -784,72 +826,80 @@ def translate_rolescopes(scopes):
     return stypes, snames, sids
 
 
-def process_approle(approles, ar):
-    rsp = db.session.get(ServicePrincipal, ar.resourceId)
-    if ar.principalType == 'ServicePrincipal':
-        sp = db.session.get(ServicePrincipal, ar.principalId)
-    if ar.principalType == 'User':
-        sp = db.session.get(User, ar.principalId)
-    if ar.principalType == 'Group':
-        sp = db.session.get(Group, ar.principalId)
-    if ar.id == '00000000-0000-0000-0000-000000000000':
-        approles.append({'objid':sp.objectId,
-                         'ptype':ar.principalType,
-                         'pname':sp.displayName,
-                         'app':ar.resourceDisplayName,
-                         'value':'Default',
-                         'desc':'Default Role',
-                         'spid':ar.resourceId,
-                        })
-    else:
-        for approle in rsp.appRoles:
-            if approle['id'] == ar.id:
-                approles.append({'objid':sp.objectId,
-                                 'ptype':ar.principalType,
-                                 'pname':sp.displayName,
-                                 'app':ar.resourceDisplayName,
-                                 'value':approle['value'],
-                                 'desc':approle['displayName'],
-                                 'spid':ar.resourceId,
-                                })
+def process_approles(assignments):
+    '''
+    Convert app role assignments to the format used in the GUI. The resource
+    service principals and the principals are loaded with one query per type,
+    with only the columns that are needed.
+    '''
+    resources = query_by_ids((ServicePrincipal.objectId, ServicePrincipal.appRoles),
+                             ServicePrincipal.objectId, {ar.resourceId for ar in assignments})
+    principals = {}
+    for ptype, model in (('ServicePrincipal', ServicePrincipal), ('User', User), ('Group', Group)):
+        pids = {ar.principalId for ar in assignments if ar.principalType == ptype}
+        principals[ptype] = query_by_ids((model.objectId, model.displayName), model.objectId, pids)
+    approles = []
+    for ar in assignments:
+        rsp = resources.get(ar.resourceId)
+        sp = principals[ar.principalType].get(ar.principalId)
+        if ar.id == '00000000-0000-0000-0000-000000000000':
+            approles.append({'objid':sp.objectId,
+                             'ptype':ar.principalType,
+                             'pname':sp.displayName,
+                             'app':ar.resourceDisplayName,
+                             'value':'Default',
+                             'desc':'Default Role',
+                             'spid':ar.resourceId,
+                            })
+        else:
+            for approle in rsp.appRoles:
+                if approle['id'] == ar.id:
+                    approles.append({'objid':sp.objectId,
+                                     'ptype':ar.principalType,
+                                     'pname':sp.displayName,
+                                     'app':ar.resourceDisplayName,
+                                     'value':approle['value'],
+                                     'desc':approle['displayName'],
+                                     'spid':ar.resourceId,
+                                    })
+    return approles
 
 @app.route("/api/approles", methods=["GET"])
 def get_approles():
-    approles = []
-    for ar in db.session.query(AppRoleAssignment).all():
-        process_approle(approles, ar)
-    return jsonify(approles)
+    return jsonify(process_approles(db.session.query(AppRoleAssignment).all()))
 
 @app.route("/api/approles_by_resource/<spid>", methods=["GET"])
 def get_approles_by_resource(spid):
-    approles = []
-    for ar in db.session.query(AppRoleAssignment).filter(AppRoleAssignment.resourceId == spid):
-        process_approle(approles, ar)
-    return jsonify(approles)
+    assignments = db.session.query(AppRoleAssignment).filter(AppRoleAssignment.resourceId == spid).all()
+    return jsonify(process_approles(assignments))
 
 @app.route("/api/approles_by_principal/<pid>", methods=["GET"])
 def get_approles_by_principal(pid):
-    approles = []
-    for ar in db.session.query(AppRoleAssignment).filter(AppRoleAssignment.principalId == pid):
-        process_approle(approles, ar)
-    return jsonify(approles)
+    assignments = db.session.query(AppRoleAssignment).filter(AppRoleAssignment.principalId == pid).all()
+    return jsonify(process_approles(assignments))
 
 @app.route("/api/oauth2permissions", methods=["GET"])
 def get_oauth2permissions():
     oauth2permissions = []
-    for permgrant in db.session.query(OAuth2PermissionGrant).all():
+    permgrants = db.session.query(OAuth2PermissionGrant).all()
+    # Load the referenced service principals and users in one go
+    sps = query_by_ids((ServicePrincipal.objectId, ServicePrincipal.displayName), ServicePrincipal.objectId,
+                       {pg.clientId for pg in permgrants} | {pg.resourceId for pg in permgrants})
+    users = query_by_ids((User.objectId, User.displayName), User.objectId,
+                         {pg.principalId for pg in permgrants if pg.consentType == 'Principal'})
+    for permgrant in permgrants:
         grant = {}
-        rsp = db.session.get(ServicePrincipal, permgrant.clientId)
+        rsp = sps.get(permgrant.clientId)
         if permgrant.consentType == 'Principal':
             grant['type'] = 'user'
-            user = db.session.get(User, permgrant.principalId)
+            user = users.get(permgrant.principalId)
             grant['userid'] = user.objectId
             grant['userdisplayname'] = user.displayName
         else:
             grant['type'] = 'all'
             grant['userid'] = None
             grant['userdisplayname'] = None
-        targetapp = db.session.get(ServicePrincipal, permgrant.resourceId)
+        targetapp = sps.get(permgrant.resourceId)
         grant['targetapplication'] = targetapp.displayName
         grant['targetspobjectid'] = targetapp.objectId
         grant['sourceapplication'] = rsp.displayName
@@ -862,7 +912,13 @@ def get_oauth2permissions():
 @app.route("/api/roledefinitions", methods=["GET"])
 def get_allroles():
     allroles = []
-    for role in db.session.query(RoleDefinition).all():
+    roles = db.session.query(RoleDefinition).options(selectinload(RoleDefinition.assignments),
+                                                     selectinload(RoleDefinition.eligibleAssignments)).all()
+    # Resolve all principals and scope objects up front
+    all_assignments = [assignment for role in roles for assignment in role.assignments + role.eligibleAssignments]
+    principals = resolve_objectids({assignment.principalId for assignment in all_assignments})
+    scope_names = get_scope_names({scope for assignment in all_assignments for scope in assignment.resourceScopes})
+    for role in roles:
         roleobj = {
             'objectId': role.objectId,
             'displayName': role.displayName,
@@ -872,7 +928,7 @@ def get_allroles():
             'assignments': []
         }
         for assignment in role.assignments:
-            stypes, snames, sids = translate_rolescopes(assignment.resourceScopes)
+            stypes, snames, sids = translate_rolescopes(assignment.resourceScopes, scope_names)
             aobj = {
                 'type': 'assignment',
                 'scope': assignment.resourceScopes,
@@ -880,12 +936,11 @@ def get_allroles():
                 'scopeNames': snames,
                 'scopeIds': sids
             }
-            principalType, principal = resolve_objectid(assignment.principalId)
+            principalType, principal, group = principals.get(assignment.principalId, ('Unknown', None, None))
             aobj['principal'] = principal
 
             roleobj['assignments'].append(aobj)
             if principalType == 'Group':
-                group = db.session.get(Group, assignment.principalId)
                 for member in group.memberUsers:
                     mp = users_schema.dump([member])[0]
                     mp['displayName'] = f"{principal['displayName']} member: {mp['displayName']}"
@@ -910,7 +965,7 @@ def get_allroles():
                     })
 
         for assignment in role.eligibleAssignments:
-            stypes, snames, sids = translate_rolescopes(assignment.resourceScopes)
+            stypes, snames, sids = translate_rolescopes(assignment.resourceScopes, scope_names)
             aobj = {
                 'type': 'eligible',
                 'scope': assignment.resourceScopes,
@@ -918,11 +973,10 @@ def get_allroles():
                 'scopeNames': snames,
                 'scopeIds': sids
             }
-            principalType, principal = resolve_objectid(assignment.principalId)
+            principalType, principal, group = principals.get(assignment.principalId, ('Unknown', None, None))
             aobj['principal'] = principal
             roleobj['assignments'].append(aobj)
             if principalType == 'Group':
-                group = db.session.get(Group, assignment.principalId)
                 for member in group.memberUsers:
                     mp = users_schema.dump([member])[0]
                     mp['displayName'] = f"{principal['displayName']} member: {mp['displayName']}"
