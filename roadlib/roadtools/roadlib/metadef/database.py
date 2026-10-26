@@ -1,8 +1,9 @@
 import os
 import json
+import hashlib
 import datetime
 import sqlalchemy.types
-from sqlalchemy import Column, Text, Boolean, BigInteger as Integer, create_engine, Table, ForeignKey
+from sqlalchemy import Column, Text, Boolean, BigInteger as Integer, create_engine, Table, ForeignKey, Index
 from sqlalchemy.orm import relationship, sessionmaker, foreign, declarative_base
 from sqlalchemy.types import TypeDecorator, TEXT
 Base = declarative_base()
@@ -331,20 +332,20 @@ class AppRoleAssignment(Base, SerializeMixin):
     creationTimestamp = Column(DateTime)
     id = Column(Text)
     principalDisplayName = Column(Text)
-    principalId = Column(Text)
+    principalId = Column(Text, index=True)
     principalType = Column(Text)
     resourceDisplayName = Column(Text)
-    resourceId = Column(Text)
+    resourceId = Column(Text, index=True)
 
 
 class OAuth2PermissionGrant(Base, SerializeMixin):
     __tablename__ = "OAuth2PermissionGrants"
-    clientId = Column(Text)
+    clientId = Column(Text, index=True)
     consentType = Column(Text)
     expiryTime = Column(DateTime)
     objectId = Column(Text, primary_key=True)
-    principalId = Column(Text)
-    resourceId = Column(Text)
+    principalId = Column(Text, index=True)
+    resourceId = Column(Text, index=True)
     scope = Column(Text)
     startTime = Column(DateTime)
 
@@ -541,7 +542,7 @@ class ServicePrincipal(Base, SerializeMixin):
     appCategory = Column(Text)
     appData = Column(Text)
     appDisplayName = Column(Text)
-    appId = Column(Text)
+    appId = Column(Text, index=True)
     applicationTemplateId = Column(Text)
     appMetadata = Column(JSON)
     appOwnerTenantId = Column(Text)
@@ -763,7 +764,7 @@ class Application(Base, SerializeMixin):
     appBranding = Column(JSON)
     appCategory = Column(Text)
     appData = Column(Text)
-    appId = Column(Text)
+    appId = Column(Text, index=True)
     applicationTemplateId = Column(Text)
     appMetadata = Column(JSON)
     appRoles = Column(JSON)
@@ -1059,9 +1060,9 @@ class RoleDefinition(Base, SerializeMixin):
 class RoleAssignment(Base, SerializeMixin):
     __tablename__ = "RoleAssignments"
     id = Column(Text, primary_key=True)
-    principalId = Column(Text)
+    principalId = Column(Text, index=True)
     resourceScopes = Column(JSON)
-    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"))
+    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"), index=True)
     roleDefinition = relationship("RoleDefinition",
         back_populates="assignments")
 
@@ -1069,9 +1070,9 @@ class RoleAssignment(Base, SerializeMixin):
 class EligibleRoleAssignment(Base, SerializeMixin):
     __tablename__ = "EligibleRoleAssignments"
     id = Column(Text, primary_key=True)
-    principalId = Column(Text)
+    principalId = Column(Text, index=True)
     resourceScopes = Column(JSON)
-    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"))
+    roleDefinitionId = Column(Text, ForeignKey("RoleDefinitions.objectId"), index=True)
     roleDefinition = relationship("RoleDefinition",
         back_populates="eligibleAssignments")
 
@@ -1777,6 +1778,19 @@ class AZresource(Base, SerializeMixin):
     tags = Column(JSON)
     extended_location = Column(JSON)
 
+
+# Index both columns of every link table, these are used for all relationship
+# lookups in both directions. Columns on the object tables that are queried
+# directly have index=True in their definition above.
+# roadrecon gui creates any of these that are missing on older databases.
+for _table in list(Base.metadata.tables.values()):
+    if _table.name.startswith('lnk_'):
+        for _column in _table.columns:
+            _name = f'ix_{_table.name}_{_column.name}'
+            if len(_name) > 63:
+                # Postgres limits identifiers to 63 characters
+                _name = _name[:54] + '_' + hashlib.md5(_name.encode()).hexdigest()[:8]
+            Index(_name, _column)
 
 def parse_db_argument(dbarg):
     '''

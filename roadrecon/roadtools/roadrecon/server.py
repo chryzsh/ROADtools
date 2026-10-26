@@ -4,7 +4,7 @@ from flask_marshmallow import Marshmallow
 from flask_cors import CORS
 from marshmallow_sqlalchemy import ModelConverter
 from marshmallow import fields
-from roadtools.roadlib.metadef.database import User, JSON, Group, DirectoryRole, \
+from roadtools.roadlib.metadef.database import Base, User, JSON, Group, DirectoryRole, \
 ServicePrincipal, AppRoleAssignment, TenantDetail, Application, Device, \
 OAuth2PermissionGrant, AuthorizationPolicy, DirectorySetting, AdministrativeUnit, \
 RoleDefinition, Policy, lnk_policy_user_include_allusers, PIMgovernanceResource, \
@@ -17,7 +17,8 @@ import base64
 import zlib
 import argparse
 import json
-from sqlalchemy import func, and_, or_, select, desc, asc, cast, collate
+from sqlalchemy import func, and_, or_, select, desc, asc, cast, collate, inspect
+from sqlalchemy.exc import SQLAlchemyError
 import mimetypes
 
 app = Flask(__name__)
@@ -1023,6 +1024,29 @@ def query_all_items(request, schema, model, searchfields):
     }
     return jsonify(result)
 
+def ensure_indexes():
+    '''
+    Create indexes from the database definition that are missing, for
+    databases created by older roadrecon versions. Without them most
+    relationship lookups are full table scans.
+    '''
+    inspector = inspect(db.engine)
+    missing = []
+    for table in Base.metadata.sorted_tables:
+        if not table.indexes or not inspector.has_table(table.name):
+            continue
+        existing = {index['name'] for index in inspector.get_indexes(table.name)}
+        missing += [index for index in table.indexes if index.name not in existing]
+    if not missing:
+        return
+    print(f'Adding {len(missing)} missing indexes to the database to speed up the GUI (only needed once)')
+    try:
+        with db.engine.begin() as conn:
+            for index in missing:
+                index.create(conn)
+    except SQLAlchemyError as exc:
+        print(f'Could not add indexes, the GUI will be slower on large databases: {getattr(exc, "orig", exc)}')
+
 def create_app_test():
     '''
     Create app for unit tests
@@ -1067,6 +1091,8 @@ def main(args=None):
     else:
         app.config['SQLALCHEMY_DATABASE_URI'] = args.database
     db = SQLAlchemy(app)
+    with app.app_context():
+        ensure_indexes()
     if args.profile:
         from werkzeug.middleware.profiler import ProfilerMiddleware
         app.wsgi_app = ProfilerMiddleware(app.wsgi_app, restrictions=[5])
