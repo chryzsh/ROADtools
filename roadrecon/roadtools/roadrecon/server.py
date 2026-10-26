@@ -616,7 +616,9 @@ def administrativeunit_detail(id):
 
 @app.route("/api/serviceprincipals", methods=["GET"])
 def get_sps():
-    all_sps = db.session.query(ServicePrincipal).all()
+    # Load the owners for all SPs at once instead of one query per SP
+    all_sps = db.session.query(ServicePrincipal).options(selectinload(ServicePrincipal.ownerUsers),
+                                                         selectinload(ServicePrincipal.ownerServicePrincipals)).all()
     return serviceprincipals_schema.jsonify(all_sps)
 
 @app.route("/api/serviceprincipals/<id>", methods=["GET"])
@@ -655,7 +657,8 @@ def app_detail_by_appid(id):
 
 @app.route("/api/applications", methods=["GET"])
 def get_applications():
-    all_applications = db.session.query(Application).all()
+    all_applications = db.session.query(Application).options(selectinload(Application.ownerUsers),
+                                                             selectinload(Application.ownerServicePrincipals)).all()
     result = applications_schema.dump(all_applications)
     return jsonify(result)
 
@@ -1005,7 +1008,11 @@ def get_allroles():
 
 @app.route("/api/directoryroles", methods=["GET"])
 def get_dirroles():
-    drs = db.session.query(DirectoryRole).all()
+    drs = db.session.query(DirectoryRole).options(
+        selectinload(DirectoryRole.memberUsers),
+        selectinload(DirectoryRole.memberGroups),
+        selectinload(DirectoryRole.memberServicePrincipals).selectinload(ServicePrincipal.ownerUsers),
+        selectinload(DirectoryRole.memberServicePrincipals).selectinload(ServicePrincipal.ownerServicePrincipals)).all()
     return directoryroles_schema.jsonify(drs)
 
 @app.route("/api/tenantdetails", methods=["GET"])
