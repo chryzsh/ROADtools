@@ -19,7 +19,7 @@ import argparse
 import json
 from sqlalchemy import func, and_, or_, select, desc, asc, cast, collate, inspect
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, load_only
 import mimetypes
 
 app = Flask(__name__)
@@ -295,6 +295,13 @@ azroleassignments_schema = AZroleAssignmentsSchema(many=True)
 azeligibleroleassignments_schema = AZeligibleRoleAssignmentsSchema(many=True)
 pimresource_schema = PIMgovernanceResourceSchema()
 
+def list_columns(model, schema):
+    '''
+    Columns of model that are output by schema. Used with load_only on lists,
+    so the other columns (mostly large JSON fields) are not loaded and decoded.
+    '''
+    return [getattr(model, field) for field in schema.fields if field in model.__table__.columns]
+
 @app.route("/")
 def get_index():
     return send_file('dist_gui/index.html')
@@ -312,7 +319,7 @@ def get_gui(path):
 
 @app.route("/api/users", methods=["GET"])
 def get_users():
-    all_users = db.session.query(User).all()
+    all_users = db.session.query(User).options(load_only(*list_columns(User, users_schema))).all()
     result = users_schema.dump(all_users)
     return jsonify(result)
 
@@ -329,7 +336,7 @@ def user_detail(id):
 
 @app.route("/api/devices", methods=["GET"])
 def get_devices():
-    all_devices = db.session.query(Device).all()
+    all_devices = db.session.query(Device).options(load_only(*list_columns(Device, devices_schema))).all()
     result = devices_schema.dump(all_devices)
     return jsonify(result)
 
@@ -560,7 +567,7 @@ def policies_locations():
 
 @app.route("/api/groups", methods=["GET"])
 def get_groups():
-    all_groups = db.session.query(Group).all()
+    all_groups = db.session.query(Group).options(load_only(*list_columns(Group, groups_schema))).all()
     result = groups_schema.dump(all_groups)
     return jsonify(result)
 
@@ -617,8 +624,10 @@ def administrativeunit_detail(id):
 @app.route("/api/serviceprincipals", methods=["GET"])
 def get_sps():
     # Load the owners for all SPs at once instead of one query per SP
-    all_sps = db.session.query(ServicePrincipal).options(selectinload(ServicePrincipal.ownerUsers),
-                                                         selectinload(ServicePrincipal.ownerServicePrincipals)).all()
+    all_sps = db.session.query(ServicePrincipal).options(
+        load_only(*list_columns(ServicePrincipal, serviceprincipals_schema)),
+        selectinload(ServicePrincipal.ownerUsers).load_only(*list_columns(User, users_schema)),
+        selectinload(ServicePrincipal.ownerServicePrincipals)).all()
     return serviceprincipals_schema.jsonify(all_sps)
 
 @app.route("/api/serviceprincipals/<id>", methods=["GET"])
@@ -657,8 +666,10 @@ def app_detail_by_appid(id):
 
 @app.route("/api/applications", methods=["GET"])
 def get_applications():
-    all_applications = db.session.query(Application).options(selectinload(Application.ownerUsers),
-                                                             selectinload(Application.ownerServicePrincipals)).all()
+    all_applications = db.session.query(Application).options(
+        load_only(*list_columns(Application, applications_schema)),
+        selectinload(Application.ownerUsers).load_only(*list_columns(User, users_schema)),
+        selectinload(Application.ownerServicePrincipals)).all()
     result = applications_schema.dump(all_applications)
     return jsonify(result)
 
@@ -671,7 +682,9 @@ def get_mfa():
     #     enabledusers.append(approle.principalId)
 
     # Filter out mailbox-only users by default
-    all_mfa = db.session.execute(select(User).where(
+    all_mfa = db.session.execute(select(User).options(load_only(
+        User.objectId, User.displayName, User.userPrincipalName, User.accountEnabled,
+        User.strongAuthenticationDetail, User.searchableDeviceKey)).where(
         or_(User.cloudMSExchRecipientDisplayType is None,
             and_(
                 User.cloudMSExchRecipientDisplayType != 0,
@@ -739,7 +752,7 @@ def resolve_objectids(oids):
         ('User', User, users_schema, ()),
         ('ServicePrincipal', ServicePrincipal, serviceprincipals_schema, sp_owners),
         # Group members are needed to expand role assignments to groups
-        ('Group', Group, groups_schema, (selectinload(Group.memberUsers),
+        ('Group', Group, groups_schema, (selectinload(Group.memberUsers).load_only(*list_columns(User, users_schema)),
                                          selectinload(Group.memberServicePrincipals).selectinload(ServicePrincipal.ownerUsers),
                                          selectinload(Group.memberServicePrincipals).selectinload(ServicePrincipal.ownerServicePrincipals))),
         ('Device', Device, devices_schema, ()),
@@ -1051,7 +1064,7 @@ def query_all_items(request, schema, model, searchfields):
     sort_column = request.args.get('sortColumn', type=str)
     sort_order = request.args.get('sortDirection', type=str)
 
-    query = db.session.query(model)
+    query = db.session.query(model).options(load_only(*list_columns(model, schema)))
 
     if search and search != 'undefined':
         # For now only search on the userPrincipalName and displayName fields, others will be added with advanced filtering
