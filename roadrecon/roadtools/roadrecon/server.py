@@ -522,16 +522,15 @@ def policies_locations():
     for policy in db.session.query(Policy).filter(Policy.policyType == 6).order_by(Policy.displayName):
         loc = {}
         loc['displayName'] = policy.displayName
-        detail = None
-        oldpolicy = False
+        # Old format: one record can hold several known networks, one per policyDetail entry
+        knownnetworks = []
 
         for pdetail in policy.policyDetail:
             detaildata = json.loads(pdetail)
             if 'KnownNetworkPolicies' in detaildata:
-                detail = detaildata['KnownNetworkPolicies']
-                oldpolicy = True
+                knownnetworks.append(detaildata['KnownNetworkPolicies'])
 
-        if not oldpolicy:
+        if not knownnetworks:
             # New format
             detail = json.loads(policy.policyDetail[0])
             if not detail:
@@ -545,15 +544,17 @@ def policies_locations():
             locs[policy.policyIdentifier] = loc
         else:
             # Old format
-            if not detail:
-                continue
-            loc['displayName'] = detail.get("NetworkName")
-            loc['trusted'] = ("trusted" in detail.get("Categories","") if detail.get("Categories") else False)
-            loc['appliesToUnknownCountry'] = str(detail.get("ApplyToUnknownCountry")) if detail.get("ApplyToUnknownCountry") is not None else False
-            loc['ipRanges'] = detail.get('CidrIpRanges') if detail.get("CidrIpRanges") else ""
-            loc['categories'] = detail.get("Categories") if detail.get("Categories") is not None else ""
-            loc['countryCodes'] =  detail.get("CountryIsoCodes") if detail.get("CountryIsoCodes") else None
-            locs[detail.get("NetworkId")] = loc
+            for detail in knownnetworks:
+                if not detail:
+                    continue
+                loc = {}
+                loc['displayName'] = detail.get("NetworkName")
+                loc['trusted'] = ("trusted" in detail.get("Categories","") if detail.get("Categories") else False)
+                loc['appliesToUnknownCountry'] = str(detail.get("ApplyToUnknownCountry")) if detail.get("ApplyToUnknownCountry") is not None else False
+                loc['ipRanges'] = detail.get('CidrIpRanges') if detail.get("CidrIpRanges") else ""
+                loc['categories'] = detail.get("Categories") if detail.get("Categories") is not None else ""
+                loc['countryCodes'] =  detail.get("CountryIsoCodes") if detail.get("CountryIsoCodes") else None
+                locs[detail.get("NetworkId")] = loc
     return jsonify(locs)
 
 @app.route("/api/groups", methods=["GET"])
