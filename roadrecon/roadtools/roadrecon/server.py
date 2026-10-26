@@ -386,6 +386,26 @@ def user_accesspackages(id):
     result = igaccesspackagepolicys_schema.dump(packages)
     return jsonify(result)
 
+def prefetch_group_tree(groups):
+    '''
+    Load memberOf and azRoleAssignments of the groups and of all groups they
+    are nested in, with one query per nesting level, so add_ra_recursive does
+    not need a query per group. Returns the loaded groups, the caller has to
+    keep this list until it is done since the session only keeps weak references.
+    '''
+    loaded = list(groups)
+    seen = {group.objectId for group in groups}
+    frontier = seen
+    while frontier:
+        level = query_by_ids((Group,), Group.objectId, frontier,
+                             (load_only(Group.objectId),
+                              selectinload(Group.memberOf).load_only(Group.objectId),
+                              selectinload(Group.azRoleAssignments).selectinload(AZroleAssignment.role))).values()
+        loaded += level
+        frontier = {parent.objectId for group in level for parent in group.memberOf} - seen
+        seen |= frontier
+    return loaded
+
 def add_ra_recursive(group, roles, processedgroups):
     roles += group.azRoleAssignments
     if group.objectId not in processedgroups:
@@ -400,6 +420,7 @@ def user_azroleassignments(id):
         abort(404)
     roles = [] + user.azRoleAssignments
     processedgroups = set()
+    loaded = prefetch_group_tree(user.memberOf)
     for group in user.memberOf:
         add_ra_recursive(group, roles, processedgroups)
 
@@ -596,6 +617,7 @@ def group_azroleassignments(id):
         abort(404)
     roles = []
     processedgroups = set()
+    loaded = prefetch_group_tree([group])
     add_ra_recursive(group, roles, processedgroups)
 
     result = azroleassignments_schema.dump(roles)
@@ -644,6 +666,7 @@ def serviceprincipals_azroleassignments(id):
         abort(404)
     roles = [] + serviceprincipals.azRoleAssignments
     processedgroups = set()
+    loaded = prefetch_group_tree(serviceprincipals.memberOf)
     for group in serviceprincipals.memberOf:
         add_ra_recursive(group, roles, processedgroups)
 
